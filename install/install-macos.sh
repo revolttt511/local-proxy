@@ -1,0 +1,212 @@
+#!/bin/bash
+# SelfProxy — macOS installer
+#
+# Usage:
+#   bash install-macos.sh                 # install to ~/Applications/SelfProxy
+#   bash install-macos.sh --system        # install to /Applications (asks for sudo)
+#   bash install-macos.sh --dry-run       # show what would happen
+#   bash install-macos.sh --legacy ~/win-http-proxy   # migrate proxy_config.json
+#
+# Creates: SelfProxy.app bundle (Launchpad/Dock) + `selfproxy` CLI command.
+# Uninstall: bash uninstall-macos.sh
+
+set -euo pipefail
+
+APP_NAME="SelfProxy"
+VERSION="1.0"
+BUNDLE_ID="local.selfproxy"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SOURCE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+LEGACY_DIR="$HOME/win-http-proxy"
+SYSTEM_WIDE=0
+DRY_RUN=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --system)   SYSTEM_WIDE=1 ;;
+    --dry-run)  DRY_RUN=1 ;;
+    --legacy)   shift; LEGACY_DIR="${1:-$LEGACY_DIR}" ;;
+    -h|--help)  sed -n '2,12p' "$0"; exit 0 ;;
+    *) echo "Неизвестный аргумент: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+say()  { printf '%s\n' "$*"; }
+step() { printf '\n== %s\n' "$*"; }
+ok()   { printf '   OK  %s\n' "$*"; }
+warn() { printf '   !   %s\n' "$*"; }
+run()  { if [ "$DRY_RUN" = "1" ]; then say "   [dry-run] $*"; else eval "$@"; fi; }
+die()  { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
+
+[ "$(uname -s)" = "Darwin" ] || die "этот installer для macOS (сейчас: $(uname -s))"
+[ -f "$SOURCE_ROOT/proxy_tool.py" ] || die "не найден proxy_tool.py рядом с $SOURCE_ROOT"
+
+if [ "$SYSTEM_WIDE" = "1" ]; then
+  APP_DIR="/Applications/$APP_NAME"
+  BIN_DIR="/usr/local/bin"
+  SUDO="sudo"
+else
+  APP_DIR="$HOME/Applications/$APP_NAME"
+  BIN_DIR="$HOME/.local/bin"
+  SUDO=""
+fi
+
+step "$APP_NAME $VERSION — macOS installer"
+say "   source : $SOURCE_ROOT"
+say "   target : $APP_DIR"
+say "   bundle : $(dirname "$APP_DIR")/$APP_NAME.app"
+if [ "$DRY_RUN" = "1" ]; then warn "DRY RUN — ничего не меняется"; fi
+
+# --- 1. Python 3 with tkinter ------------------------------------------------
+step "Поиск Python 3 с tkinter"
+PYTHON=""
+for cand in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3 "$(command -v python3 2>/dev/null || true)"; do
+  [ -n "$cand" ] || continue
+  [ -x "$cand" ] || continue
+  if "$cand" -c "import tkinter" >/dev/null 2>&1; then
+    PYTHON="$cand"; break
+  fi
+done
+if [ -z "$PYTHON" ]; then
+  cat >&2 <<'EOF'
+Не найден python3 с поддержкой tkinter.
+Поставь так (Homebrew):
+    brew install python-tk@3.12
+или скачай Python с python.org (там tkinter уже внутри), затем запусти installer заново.
+EOF
+  exit 1
+fi
+ok "python: $PYTHON ($("$PYTHON" -c 'import sys;print(sys.version.split()[0])'))"
+
+# --- 2. Files ----------------------------------------------------------------
+step "Копирование приложения"
+run "$SUDO mkdir -p '$APP_DIR'"
+for f in start.pyw proxy_tool.py README.md; do
+  if [ -f "$SOURCE_ROOT/$f" ]; then run "$SUDO cp -f '$SOURCE_ROOT/$f' '$APP_DIR/$f'"; fi
+done
+if [ -d "$SOURCE_ROOT/assets" ]; then
+  run "$SUDO mkdir -p '$APP_DIR/assets'"
+  run "$SUDO cp -Rf '$SOURCE_ROOT/assets/.' '$APP_DIR/assets/'"
+fi
+run "$SUDO mkdir -p '$APP_DIR/install'"
+run "$SUDO cp -Rf '$SOURCE_ROOT/install/.' '$APP_DIR/install/'"
+ok "файлы на месте: $APP_DIR"
+
+# --- 3. Config migration -----------------------------------------------------
+CFG_DST="$APP_DIR/proxy_config.json"
+if [ -f "$LEGACY_DIR/proxy_config.json" ] && [ ! -f "$CFG_DST" ]; then
+  run "$SUDO cp -f '$LEGACY_DIR/proxy_config.json' '$CFG_DST'"
+  ok "перенесены подключения из $LEGACY_DIR/proxy_config.json"
+elif [ -f "$CFG_DST" ]; then
+  ok "конфиг уже на месте"
+fi
+
+# --- 4. .app bundle ----------------------------------------------------------
+step "Создание $APP_NAME.app"
+BUNDLE="$(dirname "$APP_DIR")/$APP_NAME.app"
+run "$SUDO rm -rf '$BUNDLE'"
+run "$SUDO mkdir -p '$BUNDLE/Contents/MacOS' '$BUNDLE/Contents/Resources'"
+
+PLIST_TMP="$(mktemp -t selfproxy-plist.XXXXXX)"
+cat > "$PLIST_TMP" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>$APP_NAME</string>
+    <key>CFBundleDisplayName</key><string>$APP_NAME</string>
+    <key>CFBundleExecutable</key><string>$APP_NAME</string>
+    <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>$VERSION</string>
+    <key>CFBundleVersion</key><string>$VERSION</string>
+    <key>LSMinimumSystemVersion</key><string>11.0</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSRequiresAquaSystemAppearance</key><false/>
+</dict>
+</plist>
+EOF
+run "$SUDO cp -f '$PLIST_TMP' '$BUNDLE/Contents/Info.plist'"
+rm -f "$PLIST_TMP"
+
+LAUNCHER_TMP="$(mktemp -t selfproxy-launcher.XXXXXX)"
+cat > "$LAUNCHER_TMP" <<EOF
+#!/bin/bash
+# SelfProxy launcher (generated by install-macos.sh)
+APP_DIR="$APP_DIR"
+PY=""
+for cand in "$PYTHON" /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3 "\$(command -v python3 2>/dev/null || true)"; do
+  [ -n "\$cand" ] && [ -x "\$cand" ] && "\$cand" -c "import tkinter" >/dev/null 2>&1 && { PY="\$cand"; break; }
+done
+if [ -z "\$PY" ]; then
+  osascript -e 'display alert "SelfProxy" message "Не найден python3 с tkinter. Установи: brew install python-tk@3.12"' >/dev/null 2>&1
+  exit 1
+fi
+cd "\$APP_DIR" || exit 1
+exec "\$PY" "\$APP_DIR/start.pyw" "\$@"
+EOF
+run "$SUDO cp -f '$LAUNCHER_TMP' '$BUNDLE/Contents/MacOS/$APP_NAME'"
+run "$SUDO chmod +x '$BUNDLE/Contents/MacOS/$APP_NAME'"
+rm -f "$LAUNCHER_TMP"
+
+# --- 5. Icon (icns from png, if the tooling is available) --------------------
+ICON_SRC="$APP_DIR/assets/selfproxy-logo-128.png"
+[ -f "$ICON_SRC" ] || ICON_SRC="$APP_DIR/assets/proxy-logo-128.png"
+if [ -f "$ICON_SRC" ] && command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
+  ICONSET="$(mktemp -d -t selfproxy-iconset.XXXXXX)/AppIcon.iconset"
+  mkdir -p "$ICONSET"
+  for sz in 16 32 64 128 256 512; do
+    sips -z $sz $sz "$ICON_SRC" --out "$ICONSET/icon_${sz}x${sz}.png" >/dev/null 2>&1 || true
+    sips -z $((sz*2)) $((sz*2)) "$ICON_SRC" --out "$ICONSET/icon_${sz}x${sz}@2x.png" >/dev/null 2>&1 || true
+  done
+  if iconutil -c icns "$ICONSET" -o "$(dirname "$ICONSET")/AppIcon.icns" >/dev/null 2>&1; then
+    run "$SUDO cp -f '$(dirname "$ICONSET")/AppIcon.icns' '$BUNDLE/Contents/Resources/AppIcon.icns'"
+    ok "иконка собрана (icns)"
+  else
+    warn "не удалось собрать .icns — будет иконка по умолчанию"
+  fi
+  rm -rf "$(dirname "$ICONSET")"
+else
+  warn "sips/iconutil недоступны — иконка по умолчанию"
+fi
+
+run "$SUDO xattr -dr com.apple.quarantine '$BUNDLE' 2>/dev/null || true"
+run "$SUDO touch '$BUNDLE'"
+ok "bundle готов: $BUNDLE"
+
+# --- 6. CLI command ----------------------------------------------------------
+step "Команда в терминале"
+run "mkdir -p '$BIN_DIR'"
+CLI_TMP="$(mktemp -t selfproxy-cli.XXXXXX)"
+cat > "$CLI_TMP" <<EOF
+#!/bin/bash
+exec "$BUNDLE/Contents/MacOS/$APP_NAME" "\$@"
+EOF
+run "$SUDO cp -f '$CLI_TMP' '$BIN_DIR/selfproxy'"
+run "$SUDO chmod +x '$BIN_DIR/selfproxy'"
+rm -f "$CLI_TMP"
+ok "$BIN_DIR/selfproxy"
+case ":$PATH:" in
+  *":$BIN_DIR:"*) ;;
+  *) warn "добавь в ~/.zshrc:  export PATH=\"$BIN_DIR:\$PATH\"" ;;
+esac
+
+# --- 7. Marker ---------------------------------------------------------------
+run "$SUDO tee '$APP_DIR/.selfproxy_install.json' >/dev/null" <<EOF
+{
+  "appName": "$APP_NAME",
+  "appRoot": "$APP_DIR",
+  "bundle": "$BUNDLE",
+  "python": "$PYTHON",
+  "mode": "$([ "$SYSTEM_WIDE" = "1" ] && echo system || echo user)",
+  "version": "$VERSION"
+}
+EOF
+
+step "Готово"
+say "   запуск : открыть $BUNDLE (Launchpad → $APP_NAME) или команда selfproxy"
+say "   удалить: bash $APP_DIR/install/uninstall-macos.sh"
+if [ "$DRY_RUN" = "1" ]; then warn "это был dry-run — ничего не установлено"; fi
+exit 0

@@ -1,0 +1,12 @@
+# runtime state / secrets — never commit
+proxy_config.json
+proxy.log
+proxy.log.*
+browser_profiles/
+.selfproxy_install.json
+*.bak-*
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/

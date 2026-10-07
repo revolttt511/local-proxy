@@ -3146,7 +3146,7 @@ class App(tk.Tk):
         nb.add(tab_apps, text="   Приложения   ")
         tab_conn.columnconfigure(0, weight=1)
         tab_apps.columnconfigure(0, weight=1)
-        tab_apps.rowconfigure(3, weight=1)
+        tab_apps.rowconfigure(4, weight=1)
         self._tab_conn = tab_conn
         self._tab_apps = tab_apps
 
@@ -3245,17 +3245,8 @@ class App(tk.Tk):
         foot = ttk.Frame(box, style="Panel.TFrame")
         foot.grid(row=5, column=0, sticky="ew")
         foot.columnconfigure(2, weight=1)
-        sys_cb = ttk.Checkbutton(
-            foot,
-            text="🖥 Windows",
-            variable=self.system_wide_var,
-            command=self._on_system_wide_toggle,
-            style="Box.TCheckbutton",
-        )
-        sys_cb.grid(row=0, column=0, sticky="w")
-        self._tip(sys_cb, "Ставить системный прокси Windows.\nВыкл — прокси только для приложений из списка.")
         diag_btn = ttk.Button(foot, text="🩺 Проверить", style="Ghost.TButton", command=self.run_diagnose)
-        diag_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        diag_btn.grid(row=0, column=0, sticky="w")
         self._tip(diag_btn, "Проверить parent: TCP, HTTP CONNECT, SOCKS5, TLS")
         self.endpoints_var.set(self._endpoints_text())
         ep = ttk.Label(foot, textvariable=self.endpoints_var, style="Muted.TLabel", cursor="hand2")
@@ -3277,10 +3268,45 @@ class App(tk.Tk):
         )
         hint.grid(row=1, column=0, sticky="nw", pady=(12, 0))
 
-        # ── tab 2: apps + browser + log ───────────────────────────
+        # ── tab 2: scope + apps + browser + log ───────────────────
+        scope_row = ttk.Frame(tab_apps, style="Panel.TFrame")
+        scope_row.grid(row=0, column=0, sticky="ew")
+        scope_row.columnconfigure(1, weight=1)
+        sys_cb = ttk.Checkbutton(
+            scope_row,
+            text="🖥 Весь Windows через прокси",
+            variable=self.system_wide_var,
+            command=self._on_system_wide_toggle,
+            style="Box.TCheckbutton",
+        )
+        sys_cb.grid(row=0, column=0, sticky="w")
+        self._tip(
+            sys_cb,
+            "Включено — системный прокси Windows, через прокси идёт весь трафик.\n"
+            "Выключено — прокси только для приложений из списка ниже.",
+        )
+        scope_hint = ttk.Label(
+            scope_row,
+            style="Muted.TLabel",
+            text="снято — только приложения из списка",
+        )
+        scope_hint.grid(row=0, column=1, sticky="e")
+
         self.apps_wrap = ttk.LabelFrame(tab_apps, text=" Apps ", padding=(5, 4))
-        self.apps_wrap.grid(row=0, column=0, sticky="nsew")
+        self.apps_wrap.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
         self.apps_wrap.columnconfigure(0, weight=1)
+
+        self.scope_note = ttk.Label(
+            tab_apps,
+            style="Muted.TLabel",
+            justify="left",
+            wraplength=470,
+            text=(
+                "Весь Windows идёт через прокси — список приложений не нужен.\n"
+                "Снимите галочку «Весь Windows через прокси», чтобы проксировать "
+                "только выбранные приложения."
+            ),
+        )
         apps_row = ttk.Frame(self.apps_wrap, style="Panel.TFrame")
         apps_row.grid(row=0, column=0, sticky="ew")
         apps_row.columnconfigure(0, weight=1)
@@ -3335,7 +3361,7 @@ class App(tk.Tk):
         )
 
         row2 = ttk.Frame(tab_apps, style="Panel.TFrame")
-        row2.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        row2.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         row2.columnconfigure(1, weight=1)
         saved_browser = str(self.config_data.get("browser", BROWSER_CHROME)).lower()
         if saved_browser not in BROWSER_CHOICES:
@@ -3366,7 +3392,7 @@ class App(tk.Tk):
 
         # browser profile (isolated user-data-dir) — separate from proxy connection profile
         row_bp = ttk.Frame(tab_apps, style="Panel.TFrame")
-        row_bp.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        row_bp.grid(row=3, column=0, sticky="ew", pady=(6, 0))
         row_bp.columnconfigure(1, weight=1)
         ttk.Label(row_bp, text="профиль", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 3))
         self.browser_profile_combo = ttk.Combobox(
@@ -3389,7 +3415,7 @@ class App(tk.Tk):
         self._tip(bp_tmp_btn, "Разовый профиль — удалится после закрытия браузера")
 
         log_frame = ttk.LabelFrame(tab_apps, text=" Log ", padding=(6, 4))
-        log_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+        log_frame.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(1, weight=1)
 
@@ -3518,7 +3544,11 @@ class App(tk.Tk):
             return
         if self.system_wide_var.get():
             self.apps_wrap.grid_remove()
+            if hasattr(self, "scope_note"):
+                self.scope_note.grid(row=1, column=0, sticky="nw", pady=(10, 0))
         else:
+            if hasattr(self, "scope_note"):
+                self.scope_note.grid_remove()
             self.apps_wrap.grid()
 
     def _on_enter_key(self) -> None:

@@ -1041,7 +1041,13 @@ class ParentChainService:
                 name = client.recv(ln[0])
                 if len(name) < ln[0]:
                     return
-                host = name.decode("idna", errors="replace")
+                # The idna codec rejects the errors= argument outright, so a
+                # single non-ASCII name used to raise UnicodeError and drop the
+                # whole socket — every domain-addressed CONNECT died here.
+                try:
+                    host = name.decode("idna")
+                except (UnicodeError, ValueError):
+                    host = name.decode("utf-8", errors="replace")
             elif atyp == 0x04:
                 raw = client.recv(16)
                 if len(raw) < 16:
@@ -1360,13 +1366,74 @@ def proxy_env_for_listen(local_port: int) -> dict[str, str]:
     }
 
 
-def launch_app_with_proxy(exe_path: str, local_port: int, args: Optional[list[str]] = None) -> int:
+# ── per-app proxy: env vars alone are not enough ──────────────────────────
+# HTTP_PROXY/ALL_PROXY only reach apps that read them. Chromium and Electron
+# accept the proxy on the command line; Firefox needs profile prefs; Telegram
+# Desktop has no command-line proxy at all.
+_CHROMIUM_EXES = frozenset(
+    {
+        "chrome.exe", "msedge.exe", "brave.exe", "chromium.exe", "vivaldi.exe",
+        "opera.exe", "opera_gx.exe", "yandex.exe", "thorium.exe",
+        "discord.exe", "slack.exe", "code.exe", "spotify.exe", "signal.exe",
+        "whatsapp.exe", "notion.exe", "figma.exe", "obsidian.exe",
+    }
+)
+_FIREFOX_EXES = frozenset(
+    {"firefox.exe", "waterfox.exe", "librewolf.exe", "firefox developer edition.exe"}
+)
+# No command-line proxy support: these read the OS settings or their own only.
+_NO_CLI_PROXY_EXES = frozenset({"telegram.exe"})
+
+
+def app_proxy_argv(exe_path: str, local_port: int) -> tuple[list[str], Optional[str]]:
+    """Extra argv that routes one app through the local proxy.
+
+    Returns ``(argv, note)``; ``note`` is a line for the UI log when the app
+    cannot be routed automatically.
+    """
+    label = Path(exe_path).name
+    name = label.lower()
+    if name in _FIREFOX_EXES:
+        try:
+            profile = ensure_firefox_profile("app-proxy", local_port, use_proxy=True)
+        except OSError as exc:
+            return [], f"{label}: профиль не подготовлен — {exc}"
+        return (
+            ["-no-remote", "-new-instance", "-profile", str(profile)],
+            f"{label}: изолированный профиль, SOCKS5 {LOCAL_HOST}:{local_port + 1}",
+        )
+    if name in _CHROMIUM_EXES:
+        return (
+            [
+                f"--proxy-server=http://{LOCAL_HOST}:{local_port}",
+                "--proxy-bypass-list=<-loopback>",
+            ],
+            f"{label}: --proxy-server={LOCAL_HOST}:{local_port}",
+        )
+    if name in _NO_CLI_PROXY_EXES:
+        return [], (
+            f"{label}: прокси из окружения не читает. Задай в нём один раз SOCKS5 "
+            f"{LOCAL_HOST}:{local_port + 1} (Настройки → Продвинутые → Тип подключения) — "
+            "дальше ходит через прокси при любом запуске."
+        )
+    return [], None
+
+
+def launch_app_with_proxy(
+    exe_path: str,
+    local_port: int,
+    args: Optional[list[str]] = None,
+    on_note: Optional[Callable[[str], None]] = None,
+) -> int:
     path = Path(exe_path)
     if not path.is_file():
         raise FileNotFoundError(f"Не найден файл: {exe_path}")
     env = os.environ.copy()
     env.update(proxy_env_for_listen(local_port))
-    return _detached_popen(path, list(args or []), env=env)
+    extra, note = app_proxy_argv(exe_path, local_port)
+    if note and on_note:
+        on_note(note)
+    return _detached_popen(path, [*(args or []), *extra], env=env)
 
 
 def _detached_popen(exe_path: Path, args: list[str], env: Optional[dict[str, str]] = None) -> int:
@@ -3245,8 +3312,21 @@ class App(tk.Tk):
         foot = ttk.Frame(box, style="Panel.TFrame")
         foot.grid(row=5, column=0, sticky="ew")
         foot.columnconfigure(2, weight=1)
+        sys_cb = ttk.Checkbutton(
+            foot,
+            text="🖥 Весь ОС через прокси",
+            variable=self.system_wide_var,
+            command=self._on_system_wide_toggle,
+            style="Box.TCheckbutton",
+        )
+        sys_cb.grid(row=0, column=0, sticky="w")
+        self._tip(
+            sys_cb,
+            "Включено — системный прокси ОС, через прокси идёт весь трафик.\n"
+            "Выключено — прокси только для приложений из списка на вкладке «Приложения».",
+        )
         diag_btn = ttk.Button(foot, text="🩺 Проверить", style="Ghost.TButton", command=self.run_diagnose)
-        diag_btn.grid(row=0, column=0, sticky="w")
+        diag_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
         self._tip(diag_btn, "Проверить parent: TCP, HTTP CONNECT, SOCKS5, TLS")
         self.endpoints_var.set(self._endpoints_text())
         ep = ttk.Label(foot, textvariable=self.endpoints_var, style="Muted.TLabel", cursor="hand2")
@@ -3268,30 +3348,7 @@ class App(tk.Tk):
         )
         hint.grid(row=1, column=0, sticky="nw", pady=(12, 0))
 
-        # ── tab 2: scope + apps + browser + log ───────────────────
-        scope_row = ttk.Frame(tab_apps, style="Panel.TFrame")
-        scope_row.grid(row=0, column=0, sticky="ew")
-        scope_row.columnconfigure(1, weight=1)
-        sys_cb = ttk.Checkbutton(
-            scope_row,
-            text="🖥 Весь Windows через прокси",
-            variable=self.system_wide_var,
-            command=self._on_system_wide_toggle,
-            style="Box.TCheckbutton",
-        )
-        sys_cb.grid(row=0, column=0, sticky="w")
-        self._tip(
-            sys_cb,
-            "Включено — системный прокси Windows, через прокси идёт весь трафик.\n"
-            "Выключено — прокси только для приложений из списка ниже.",
-        )
-        scope_hint = ttk.Label(
-            scope_row,
-            style="Muted.TLabel",
-            text="снято — только приложения из списка",
-        )
-        scope_hint.grid(row=0, column=1, sticky="e")
-
+        # ── tab 2: apps + browser + log ───────────────────────────
         self.apps_wrap = ttk.LabelFrame(tab_apps, text=" Apps ", padding=(5, 4))
         self.apps_wrap.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
         self.apps_wrap.columnconfigure(0, weight=1)
@@ -3302,9 +3359,9 @@ class App(tk.Tk):
             justify="left",
             wraplength=470,
             text=(
-                "Весь Windows идёт через прокси — список приложений не нужен.\n"
-                "Снимите галочку «Весь Windows через прокси», чтобы проксировать "
-                "только выбранные приложения."
+                "Весь ОС идёт через прокси — список приложений не нужен.\n"
+                "Снимите галочку «Весь ОС через прокси» на вкладке «Подключение», "
+                "чтобы проксировать только выбранные приложения."
             ),
         )
         apps_row = ttk.Frame(self.apps_wrap, style="Panel.TFrame")
@@ -3696,7 +3753,7 @@ class App(tk.Tk):
         for i in sel:
             path = self._app_paths[i]
             try:
-                pid = launch_app_with_proxy(path, local_port)
+                pid = launch_app_with_proxy(path, local_port, on_note=self._ui_log)
                 self._ui_log(f"▶ {Path(path).name} #{pid}")
             except OSError as exc:
                 messagebox.showerror("Launch", f"{Path(path).name}\n{exc}")

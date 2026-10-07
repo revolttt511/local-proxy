@@ -1384,6 +1384,19 @@ _FIREFOX_EXES = frozenset(
 # No command-line proxy support: these read the OS settings or their own only.
 _NO_CLI_PROXY_EXES = frozenset({"telegram.exe"})
 
+# Electron apps whose own host updater ignores both --proxy-server and the proxy
+# env vars — it reads only the OS proxy. When the update host is unreachable on
+# the direct path the updater retries forever and the window never appears, so
+# the launch has to be bootstrapped through WinINET for a few seconds.
+_OS_PROXY_BOOTSTRAP_EXES = frozenset(
+    {"discord.exe", "slack.exe", "code.exe", "spotify.exe"}
+)
+OS_PROXY_BOOTSTRAP_SECONDS = 60
+
+
+def needs_os_proxy_bootstrap(exe_path: str) -> bool:
+    return Path(exe_path).name.lower() in _OS_PROXY_BOOTSTRAP_EXES
+
 
 def app_proxy_argv(exe_path: str, local_port: int) -> tuple[list[str], Optional[str]]:
     """Extra argv that routes one app through the local proxy.
@@ -1428,9 +1441,14 @@ def launch_app_with_proxy(
     path = Path(exe_path)
     if not path.is_file():
         raise FileNotFoundError(f"Не найден файл: {exe_path}")
-    env = os.environ.copy()
-    env.update(proxy_env_for_listen(local_port))
     extra, note = app_proxy_argv(exe_path, local_port)
+    env = os.environ.copy()
+    if not extra:
+        # Env vars are the only lever for an app with no command-line proxy.
+        # Apps that got a flag (or a profile) must NOT also get them: Electron's
+        # Rust host updater reads HTTPS_PROXY/ALL_PROXY and dies on them, while
+        # it happily uses the OS proxy — that combination strands the launch.
+        env.update(proxy_env_for_listen(local_port))
     if note and on_note:
         on_note(note)
     return _detached_popen(path, [*(args or []), *extra], env=env)
@@ -3596,6 +3614,30 @@ class App(tk.Tk):
         save_config(self.config_data)
         self._sync_apps_visibility()
 
+    def _bootstrap_os_proxy(self, local_port: int) -> None:
+        """Point the OS proxy at us briefly so an app's own updater can start.
+
+        Electron host updaters (Discord and friends) honour neither
+        --proxy-server nor HTTP_PROXY and read only WinINET. When the update host
+        is blocked on the direct path the updater retries forever and the app's
+        window never appears. The OS proxy goes back off on a timer.
+        """
+        try:
+            set_system_proxy(True, local_port, bypass_hosts=[LOCAL_HOST, "localhost"])
+        except RuntimeError as exc:
+            self._ui_log(str(exc))
+            return
+        self._ui_log(f"OS proxy → on {OS_PROXY_BOOTSTRAP_SECONDS}s (updater bootstrap)")
+
+        def _restore() -> None:
+            try:
+                set_system_proxy(False)
+                log.info("OS proxy off — back to apps mode")
+            except RuntimeError as exc:
+                log.warning("OS proxy restore failed: %s", exc)
+
+        threading.Timer(OS_PROXY_BOOTSTRAP_SECONDS, _restore).start()
+
     def _sync_apps_visibility(self) -> None:
         if not hasattr(self, "apps_wrap"):
             return
@@ -3750,11 +3792,20 @@ class App(tk.Tk):
         if not sel:
             messagebox.showinfo("📦 Apps", "Добавь .exe кнопкой ＋")
             return
+        launched: list[str] = []
+        # An app's own updater reads the OS proxy at start, so WinINET has to
+        # point at us BEFORE the process is spawned, not after.
+        bootstrap = self.scope_var.get() == SCOPE_APPS and any(
+            needs_os_proxy_bootstrap(self._app_paths[i]) for i in sel
+        )
+        if bootstrap:
+            self._bootstrap_os_proxy(local_port)
         for i in sel:
             path = self._app_paths[i]
             try:
                 pid = launch_app_with_proxy(path, local_port, on_note=self._ui_log)
                 self._ui_log(f"▶ {Path(path).name} #{pid}")
+                launched.append(path)
             except OSError as exc:
                 messagebox.showerror("Launch", f"{Path(path).name}\n{exc}")
 

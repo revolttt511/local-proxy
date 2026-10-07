@@ -1,7 +1,7 @@
-﻿# SelfProxy — Windows installer
+﻿# Local Proxy — Windows installer
 #
 # Usage (from a normal PowerShell window, no admin needed):
-#   .\install-windows.ps1                  # install to %LOCALAPPDATA%\Programs\SelfProxy
+#   .\install-windows.ps1                  # install to %LOCALAPPDATA%\Programs\LocalProxy
 #   .\install-windows.ps1 -InPlace         # run from this folder, no copying
 #   .\install-windows.ps1 -DryRun          # show what would happen, change nothing
 #   .\install-windows.ps1 -MigrateProfiles # move browser_profiles from a legacy install
@@ -11,7 +11,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\SelfProxy'),
+    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\LocalProxy'),
     [string]$LegacyDir  = (Join-Path $env:USERPROFILE 'win-http-proxy'),
     [switch]$InPlace,
     [switch]$MigrateProfiles,
@@ -21,7 +21,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$AppName    = 'SelfProxy'
+$AppName    = 'Local Proxy'
 $SourceRoot = Split-Path -Parent $PSScriptRoot          # <app>/install/.. = <app>
 if (-not (Test-Path (Join-Path $SourceRoot 'proxy_tool.py'))) {
     throw "Не найден proxy_tool.py рядом с $SourceRoot — installer должен лежать в <app>\install\"
@@ -77,7 +77,7 @@ function Find-Python {
     return $null
 }
 
-Step "SelfProxy installer"
+Step "Local Proxy installer"
 Say "   source : $SourceRoot"
 Say "   target : $(if ($InPlace) { $SourceRoot } else { $InstallDir })"
 if ($DryRun) { Warn "DRY RUN — ничего не меняется" }
@@ -157,7 +157,7 @@ if ($MigrateProfiles) {
 $entry = Join-Path $AppRoot 'start.pyw'
 if (-not (Test-Path $entry) -and -not $DryRun) { throw "Не найден вход: $entry" }
 
-$ico = Join-Path $AppRoot 'assets\selfproxy.ico'
+$ico = Join-Path $AppRoot 'assets\localproxy.ico'
 if (-not (Test-Path $ico)) { $ico = Join-Path $AppRoot 'assets\proxy.ico' }
 if (-not (Test-Path $ico)) { $ico = $python.Gui }
 
@@ -183,7 +183,7 @@ function New-Shortcut {
 if (-not $NoShortcuts) {
     Step "Ярлыки"
     $targets = @(
-        @{ Path = (Join-Path $AppRoot 'Start SelfProxy.lnk') },
+        @{ Path = (Join-Path $AppRoot 'Start Local Proxy.lnk') },
         @{ Path = (Join-Path ([Environment]::GetFolderPath('Desktop')) "$AppName.lnk") },
         @{ Path = (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\$AppName.lnk") }
     )
@@ -206,7 +206,7 @@ $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$AppName"
 Invoke-Or-Show "registry $regPath" {
     New-Item -Path $regPath -Force | Out-Null
     Set-ItemProperty -Path $regPath -Name 'DisplayName'     -Value $AppName
-    Set-ItemProperty -Path $regPath -Name 'Publisher'       -Value 'SelfProxy'
+    Set-ItemProperty -Path $regPath -Name 'Publisher'       -Value 'Local Proxy'
     Set-ItemProperty -Path $regPath -Name 'DisplayVersion'  -Value '1.0'
     Set-ItemProperty -Path $regPath -Name 'InstallLocation' -Value $AppRoot
     Set-ItemProperty -Path $regPath -Name 'DisplayIcon'     -Value $ico
@@ -219,7 +219,7 @@ Invoke-Or-Show "registry $regPath" {
 if (-not (Test-Path $uninst)) { Warn "uninstall-windows.ps1 не найден в $AppRoot\install" }
 }
 
-$marker = Join-Path $AppRoot '.selfproxy_install.json'
+$marker = Join-Path $AppRoot '.localproxy_install.json'
 Invoke-Or-Show "marker $marker" {
     @{
         appName     = $AppName
@@ -234,6 +234,6 @@ Invoke-Or-Show "marker $marker" {
 }
 
 Step "Готово"
-Say "   запуск : Start SelfProxy.lnk, ярлык на рабочем столе или из меню Пуск"
+Say "   запуск : Start Local Proxy.lnk, ярлык на рабочем столе или из меню Пуск"
 Say "   удалить: .\uninstall-windows.ps1"
 if ($DryRun) { Warn "это был dry-run — ничего не установлено" }

@@ -10,3 +10,6 @@ __pycache__/
 .venv/
 build/
 dist/
+
+# previous branding kept locally, not published
+assets/_old/

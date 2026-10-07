@@ -1,10 +1,10 @@
 #!/bin/bash
-# SelfProxy — macOS installer, double-click friendly.
+# Local Proxy — macOS installer, double-click friendly.
 # Двойной клик по этому файлу в Finder запускает установку.
 # Если macOS отказывается запускать: правый клик → Open, либо в Терминале:
-#   chmod +x "Install SelfProxy.command" && bash "Install SelfProxy.command"
+#   chmod +x "Install Local Proxy.command" && bash "Install Local Proxy.command"
 cd "$(dirname "$0")" || exit 1
-echo "=== SelfProxy installer (macOS) ==="
+echo "=== Local Proxy installer (macOS) ==="
 echo
 bash ./install-macos.sh "$@"
 RC=$?

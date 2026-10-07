@@ -1,5 +1,5 @@
 #!/bin/bash
-# SelfProxy — macOS uninstaller
+# Local Proxy — macOS uninstaller
 #
 # Usage:
 #   bash uninstall-macos.sh            # remove app bundle + CLI command, keep config
@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-APP_NAME="SelfProxy"
+APP_NAME="Local Proxy"
 SYSTEM_WIDE=0
 PURGE=0
 DRY_RUN=0
@@ -37,8 +37,8 @@ else
   APP_DIR="$HOME/Applications/$APP_NAME"; SUDO=""
 fi
 BUNDLE="$(dirname "$APP_DIR")/$APP_NAME.app"
-CLI="/usr/local/bin/selfproxy"
-[ "$SYSTEM_WIDE" = "1" ] || CLI="$HOME/.local/bin/selfproxy"
+CLI="/usr/local/bin/localproxy"
+[ "$SYSTEM_WIDE" = "1" ] || CLI="$HOME/.local/bin/localproxy"
 
 step "Удаление $APP_NAME"
 say "   app    : $APP_DIR"
@@ -48,7 +48,7 @@ if [ "$DRY_RUN" = "1" ]; then warn "DRY RUN — ничего не удаляет
 # Stop a running instance so the bundle can be replaced/removed
 if pgrep -f "$APP_DIR/start.pyw" >/dev/null 2>&1; then
   run "pkill -f '$APP_DIR/start.pyw' || true"
-  ok "остановлен запущенный SelfProxy"
+  ok "остановлен запущенный Local Proxy"
 fi
 
 if [ -d "$BUNDLE" ]; then run "$SUDO rm -rf '$BUNDLE'"; ok "удалён bundle: $BUNDLE"; fi

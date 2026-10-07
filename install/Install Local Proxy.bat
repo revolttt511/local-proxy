@@ -1,8 +1,8 @@
 @echo off
-REM SelfProxy — Windows installer (double-click friendly)
+REM Local Proxy — Windows installer (double-click friendly)
 setlocal
 cd /d "%~dp0"
-echo Installing SelfProxy...
+echo Installing Local Proxy...
 echo.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0install-windows.ps1" %*
 set RC=%ERRORLEVEL%

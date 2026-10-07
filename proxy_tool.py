@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Windows SelfProxy GUI — pure Python, 3proxy-like chaining (no native binaries).
+"""Windows Local Proxy GUI — pure Python, 3proxy-like chaining (no native binaries).
 
 Maps to 3proxy concepts without shipping/downloading 3proxy.exe (Defender FPs):
   listen  — local HTTP (+ SOCKS5) on 127.0.0.1
@@ -10,7 +10,7 @@ Modes:
   apps    — only local listen; pick apps / set proxy in app settings (no system proxy)
   system  — also set Windows system proxy to the local HTTP listen
 
-No .exe required — run start.pyw / Start SelfProxy.lnk.
+No .exe required — run start.pyw / Start Local Proxy.lnk.
 """
 
 from __future__ import annotations
@@ -58,7 +58,10 @@ BUFFER = 65536
 CONNECT_TIMEOUT = 10.0
 UPSTREAM_TIMEOUT = 12.0
 PROTO_HTTP = "HTTP"
+PROTO_HTTPS = "HTTPS"
 PROTO_SOCKS5 = "SOCKS5"
+# Parent protocols we can talk to. HTTPS = TLS to the parent, then CONNECT inside.
+PROTO_CHOICES = (PROTO_HTTP, PROTO_HTTPS, PROTO_SOCKS5)
 SCOPE_APPS = "apps"
 SCOPE_SYSTEM = "system"
 BROWSER_CHROME = "chrome"
@@ -170,6 +173,23 @@ def _http_status_ok_connect(status_line: str) -> bool:
     parts = status_line.split()
     return len(parts) >= 2 and parts[1] == "200"
 
+def tls_wrap_parent(sock: socket.socket, host: str, timeout: float = CONNECT_TIMEOUT) -> socket.socket:
+    """Wrap a socket to the parent in TLS — HTTPS-proxy style: TLS to the proxy
+    itself, then a plain HTTP CONNECT tunnel carried inside it.
+
+    Certificate verification is off on purpose. Sellers routinely use
+    self-signed certs on their gateway, and a successful CONNECT reply already
+    proves we reached a working proxy. The tunnelled payload keeps its own
+    end-to-end TLS, so nothing user-visible is weakened.
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    sock.settimeout(timeout)
+    server_hostname = None if is_ipv6_literal(host) else host
+    return ctx.wrap_socket(sock, server_hostname=server_hostname)
+
+
 def parse_proxy_string(text: str) -> Optional[dict[str, str]]:
     """Parse common seller formats into host/port/user/pass/protocol.
 
@@ -190,6 +210,7 @@ def parse_proxy_string(text: str) -> Optional[dict[str, str]]:
     elif lower.startswith("http://"):
         raw = raw[7:]
     elif lower.startswith("https://"):
+        protocol = PROTO_HTTPS
         raw = raw[8:]
 
     # user:pass@host:port  (host may be [ipv6])
@@ -489,6 +510,9 @@ def probe_upstream(
 
     try:
         sock.settimeout(timeout)
+        if protocol == PROTO_HTTPS:
+            sock = tls_wrap_parent(sock, host, timeout=timeout)
+            sock.settimeout(timeout)
         sock.sendall(build_connect_request("example.com:443", username, password))
         reply = b""
         while b"\r\n" not in reply:
@@ -517,13 +541,13 @@ def probe_upstream(
     if not reply:
         raise RuntimeError(f"{ep} закрыл соединение без ответа.")
 
-    status = reply.split(b"\r\n", 1)[0].decode("latin-1", errors="replace")
+    status = reply.split(b"\x0d\x0a", 1)[0].decode("latin-1", errors="replace")
     if _http_status_ok_connect(status):
-        return f"HTTP OK: {status}"
+        return f"{protocol} OK: {status}"
     if "407" in status:
-        raise RuntimeError(f"HTTP 407 (логин/пароль): {status}")
+        raise RuntimeError(f"{protocol} 407 (логин/пароль): {status}")
     if status.upper().startswith("HTTP/"):
-        return f"HTTP отвечает: {status}"
+        return f"{protocol} отвечает: {status}"
     raise RuntimeError(f"Не HTTP-ответ: {status!r}. Попробуйте SOCKS5.")
 
 
@@ -540,19 +564,17 @@ def probe_upstream_fast(
     Returns (protocol, result_message). Prefers user's selection when both work.
     Connect wait ≈ timeout (not serial 8s+8s).
     """
-    prefer = prefer if prefer in (PROTO_HTTP, PROTO_SOCKS5) else PROTO_HTTP
-    alt = PROTO_SOCKS5 if prefer == PROTO_HTTP else PROTO_HTTP
+    prefer = prefer if prefer in PROTO_CHOICES else PROTO_HTTP
+    alts = [p for p in PROTO_CHOICES if p != prefer]
     alt_hit: Optional[tuple[str, str]] = None
     prefer_err: Optional[BaseException] = None
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=1 + len(alts)) as pool:
         fut_map = {
             pool.submit(
-                probe_upstream, host, port, username, password, prefer, timeout
-            ): prefer,
-            pool.submit(
-                probe_upstream, host, port, username, password, alt, timeout
-            ): alt,
+                probe_upstream, host, port, username, password, proto, timeout
+            ): proto
+            for proto in (prefer, *alts)
         }
         try:
             for fut in as_completed(fut_map, timeout=timeout + 1.0):
@@ -567,7 +589,8 @@ def probe_upstream_fast(
                     continue
                 if proto == prefer:
                     return prefer, msg
-                alt_hit = (proto, msg)
+                if alt_hit is None:
+                    alt_hit = (proto, msg)
                 if prefer_err is not None:
                     return alt_hit
         except TimeoutError:
@@ -577,7 +600,7 @@ def probe_upstream_fast(
         return alt_hit
     if prefer_err is not None:
         raise RuntimeError(str(prefer_err)) from prefer_err
-    raise RuntimeError("Parent не отвечает (HTTP/SOCKS5)")
+    raise RuntimeError("Parent не отвечает (HTTP/HTTPS/SOCKS5)")
 
 def send_error(client: socket.socket, code: int, reason: str, detail: str) -> None:
     body = detail.encode("utf-8", errors="replace")
@@ -634,7 +657,7 @@ def open_via_parent(
     target_host: str,
     target_port: int,
 ) -> socket.socket:
-    """Open TCP to target through parent (HTTP CONNECT or SOCKS5) — like 3proxy parent."""
+    """Open TCP to target through parent (HTTP CONNECT, HTTPS/TLS-to-parent or SOCKS5)."""
     parent_host = strip_brackets(parent_host)
     target_host = strip_brackets(target_host)
     if protocol == PROTO_SOCKS5:
@@ -645,6 +668,9 @@ def open_via_parent(
     sock = socket.create_connection((parent_host, parent_port), timeout=CONNECT_TIMEOUT)
     sock.settimeout(UPSTREAM_TIMEOUT)
     try:
+        if protocol == PROTO_HTTPS:
+            sock = tls_wrap_parent(sock, parent_host)
+            sock.settimeout(UPSTREAM_TIMEOUT)
         target = f"{format_host_for_url(target_host)}:{target_port}"
         sock.sendall(build_connect_request(target, username, password))
         reply = b""
@@ -787,6 +813,16 @@ class ParentChainService:
             timeout=CONNECT_TIMEOUT,
         )
         sock.settimeout(UPSTREAM_TIMEOUT)
+        if self.protocol == PROTO_HTTPS:
+            try:
+                sock = tls_wrap_parent(sock, self.parent_host)
+            except Exception:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                raise
+            sock.settimeout(UPSTREAM_TIMEOUT)
         self._track(sock)
         return sock
 
@@ -1276,7 +1312,8 @@ def load_config() -> dict[str, Any]:
             }
             save_config(data)
         for c in data.get("connections", []):
-            c.setdefault("protocol", PROTO_HTTP)
+            if c.get("protocol") not in PROTO_CHOICES:
+                c["protocol"] = PROTO_HTTP
         data.setdefault("connections", [])
         data.setdefault("last_selected", "")
         data.setdefault("local_port", DEFAULT_LOCAL_PORT)
@@ -1906,7 +1943,7 @@ def _http_get_via_connect_proxy(
         req = (
             f"GET {path} HTTP/1.1\r\n"
             f"Host: {host}\r\n"
-            f"User-Agent: SelfProxy/1.0\r\n"
+            f"User-Agent: LocalProxy/1.0\r\n"
             f"Accept: application/json\r\n"
             f"Connection: close\r\n"
             f"\r\n"
@@ -2768,7 +2805,7 @@ class ToolTip:
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("SelfProxy")
+        self.title("Local Proxy")
         self.geometry("470x580")
         self.minsize(450, 520)
         self.configure(bg="#E6EBF0")
@@ -2789,24 +2826,27 @@ class App(tk.Tk):
         cleaned = cleanup_stale_tmp_browser_profiles()
         if cleaned:
             log.info("Очищено stale tmp-профилей: %s", cleaned)
-        log.info("SelfProxy запущено")
+        log.info("Local Proxy запущено")
 
     def _build_styles(self) -> None:
-        # Soft neutral (cool sand / muted teal) — not B&W
-        self._bg = "#E6EBF0"
-        self._face = "#D5DDE6"
-        self._ink = "#2F3A45"
-        self._muted = "#6A7785"
-        self._slate = "#5B7C8A"
-        self._slate_hi = "#6D8F9C"
-        self._slate_press = "#4A6773"
-        self._warm = "#8A7A6E"
-        self._select = "#6A8494"
-        self._card = "#F3F6F8"
-        self._line = "#B7C2CC"
+        # ── Liquid Glass, light ───────────────────────────────────────
+        # Near-white frosted body, glass panels, one accent that matches the
+        # Tor mark on the icon.
+        self._bg = "#EDF0F6"          # window body (light grey)
+        self._face = "#FFFFFF"        # raised glass
+        self._ink = "#1E2433"         # primary text
+        self._muted = "#6C7688"       # secondary text
+        self._slate = "#7B3FE4"       # accent (Tor purple)
+        self._slate_hi = "#9A63F0"
+        self._slate_press = "#5F2CB8"
+        self._warm = "#E5484D"        # danger / disconnect
+        self._select = "#CDB8F5"
+        self._card = "#FFFFFF"        # field fill
+        self._line = "#D5DCE8"        # hairline
+        self._glass_hi = "#FFFFFF"    # top edge highlight
         self._accent = self._slate
-        self._log_bg = "#334049"
-        self._log_fg = "#C5D0D8"
+        self._log_bg = "#F7F9FD"
+        self._log_fg = "#2A3550"
 
         style = ttk.Style(self)
         try:
@@ -2814,130 +2854,229 @@ class App(tk.Tk):
         except tk.TclError:
             pass
 
-        ui = ("Tahoma", 8)
-        ui_b = ("Tahoma", 8, "bold")
+        ui = ("Segoe UI", 9)
+        ui_s = ("Segoe UI", 8)
+        ui_b = ("Segoe UI", 9, "bold")
 
         style.configure(".", background=self._bg, foreground=self._ink, font=ui)
         style.configure("TFrame", background=self._bg)
         style.configure("Panel.TFrame", background=self._bg)
+        style.configure("Glass.TFrame", background=self._face)
+        style.configure("Divider.TFrame", background=self._line)
         style.configure("TLabel", background=self._bg, foreground=self._ink, font=ui)
-        style.configure("Muted.TLabel", background=self._bg, foreground=self._muted, font=("Tahoma", 7))
-        style.configure("Field.TLabel", background=self._bg, foreground=self._muted, font=("Tahoma", 8))
-        style.configure("Brand.TLabel", background=self._bg, foreground=self._ink, font=("Tahoma", 10, "bold"))
-        style.configure("StatusOff.TLabel", background=self._bg, foreground=self._muted, font=("Tahoma", 7))
-        style.configure("StatusOn.TLabel", background=self._bg, foreground=self._slate, font=("Tahoma", 7, "bold"))
+        style.configure("Glass.TLabel", background=self._face, foreground=self._ink, font=ui)
+        style.configure("Muted.TLabel", background=self._bg, foreground=self._muted, font=ui_s)
+        style.configure("Field.TLabel", background=self._bg, foreground=self._muted, font=ui_s)
+        style.configure("Brand.TLabel", background=self._bg, foreground=self._ink, font=("Segoe UI", 12, "bold"))
+        style.configure("Sub.TLabel", background=self._bg, foreground=self._muted, font=("Segoe UI", 8))
+        style.configure("StatusOff.TLabel", background=self._bg, foreground=self._muted, font=ui_s)
+        style.configure("StatusOn.TLabel", background=self._bg, foreground="#12855A", font=("Segoe UI", 8, "bold"))
+
+        # fields — inset frosted glass
         style.configure(
             "TEntry",
             fieldbackground=self._card,
             foreground=self._ink,
             insertcolor=self._ink,
-            padding=1,
+            padding=3,
             bordercolor=self._line,
-            lightcolor="#FFFFFF",
-            darkcolor=self._line,
+            lightcolor=self._glass_hi,
+            darkcolor="#C3CBD9",
         )
+        style.map("TEntry", bordercolor=[("focus", self._slate)])
         style.configure(
             "TCombobox",
             fieldbackground=self._card,
             foreground=self._ink,
-            padding=0,
+            background=self._face,
+            arrowcolor=self._muted,
+            padding=2,
             bordercolor=self._line,
-            arrowcolor=self._ink,
+            lightcolor=self._glass_hi,
+            darkcolor="#C3CBD9",
         )
         style.map(
             "TCombobox",
             fieldbackground=[("readonly", self._card)],
             foreground=[("readonly", self._ink)],
             selectbackground=[("readonly", self._select)],
-            selectforeground=[("readonly", "#FFFFFF")],
+            selectforeground=[("readonly", self._ink)],
+            bordercolor=[("focus", self._slate)],
         )
+        # dropdown list of the combobox (a plain Tk listbox under the hood)
+        self.option_add("*TCombobox*Listbox.background", "#FFFFFF")
+        self.option_add("*TCombobox*Listbox.foreground", self._ink)
+        self.option_add("*TCombobox*Listbox.selectBackground", self._select)
+        self.option_add("*TCombobox*Listbox.selectForeground", self._ink)
+
+        # buttons — a bright glass pill for the primary action
         style.configure(
             "Primary.TButton",
             font=ui_b,
-            padding=(8, 4),
+            padding=(10, 6),
             background=self._slate,
-            foreground="#F4F7F8",
+            foreground="#FFFFFF",
             bordercolor=self._slate_press,
             lightcolor=self._slate_hi,
             darkcolor=self._slate_press,
             borderwidth=1,
+            focuscolor=self._slate,
         )
         style.map(
             "Primary.TButton",
-            background=[("active", self._slate_hi), ("pressed", self._slate_press)],
-            foreground=[("active", "#FFFFFF"), ("pressed", "#FFFFFF")],
+            background=[("active", self._slate_hi), ("pressed", self._slate_press),
+                        ("disabled", "#E2E6EF")],
+            foreground=[("disabled", "#9AA3B5")],
+            bordercolor=[("disabled", "#D5DCE8")],
+            lightcolor=[("disabled", "#FFFFFF")],
+            darkcolor=[("disabled", "#D5DCE8")],
         )
         style.configure(
             "Danger.TButton",
             font=ui_b,
-            padding=(8, 4),
+            padding=(10, 6),
             background=self._warm,
-            foreground="#F7F4F1",
-            bordercolor="#5C5048",
-            lightcolor="#9A8A7C",
-            darkcolor="#5C5048",
+            foreground="#FFFFFF",
+            bordercolor="#C13A3E",
+            lightcolor="#F2686C",
+            darkcolor="#C13A3E",
             borderwidth=1,
         )
         style.map(
             "Danger.TButton",
-            background=[("active", "#9A8A7C"), ("pressed", "#5C5048")],
-            foreground=[("active", "#FFFFFF"), ("pressed", "#FFFFFF")],
+            background=[("active", "#EF5F64"), ("pressed", "#CC3F43"),
+                        ("disabled", "#E2E6EF")],
+            foreground=[("disabled", "#9AA3B5")],
+            bordercolor=[("disabled", "#D5DCE8")],
+            lightcolor=[("disabled", "#FFFFFF")],
+            darkcolor=[("disabled", "#D5DCE8")],
         )
         style.configure(
             "Ghost.TButton",
             font=ui,
-            padding=(4, 1),
+            padding=(5, 2),
             background=self._face,
             foreground=self._ink,
-            bordercolor="#8A96A0",
-            lightcolor="#F3F6F8",
-            darkcolor="#9AA6B0",
+            bordercolor=self._line,
+            lightcolor=self._glass_hi,
+            darkcolor="#C3CBD9",
             borderwidth=1,
         )
         style.map(
             "Ghost.TButton",
-            background=[("active", "#F3F6F8"), ("pressed", "#C5CED6")],
+            background=[("active", "#F3F5FA"), ("pressed", "#E4E8F1"),
+                        ("disabled", "#F2F4F8")],
+            foreground=[("disabled", "#A8B0C0")],
         )
         style.configure(
             "TCheckbutton",
             background=self._bg,
             foreground=self._ink,
-            font=("Tahoma", 7),
+            font=ui_s,
             indicatorcolor="#FFFFFF",
-            bordercolor="#8A96A0",
+            bordercolor=self._line,
+            lightcolor=self._glass_hi,
+            darkcolor="#C3CBD9",
+            focuscolor=self._slate,
         )
         style.map(
             "TCheckbutton",
             background=[("active", self._bg)],
             indicatorcolor=[("selected", self._slate), ("!selected", "#FFFFFF")],
         )
-        style.configure("Box.TCheckbutton", background=self._bg, foreground=self._ink, font=("Tahoma", 7))
+        style.configure(
+            "Box.TCheckbutton",
+            background=self._bg,
+            foreground=self._ink,
+            font=ui_s,
+            indicatorcolor="#FFFFFF",
+            bordercolor=self._line,
+        )
         style.map(
             "Box.TCheckbutton",
             background=[("active", self._bg)],
             indicatorcolor=[("selected", self._slate), ("!selected", "#FFFFFF")],
         )
-        style.configure("TButton", font=ui, padding=(4, 1), background=self._face, foreground=self._ink)
+        style.configure("TButton", font=ui, padding=(5, 2), background=self._face,
+                        foreground=self._ink, bordercolor=self._line)
+        # section cards — frosted glass plates
         style.configure(
             "TLabelframe",
             background=self._bg,
             foreground=self._ink,
             bordercolor=self._line,
-            relief="groove",
+            lightcolor=self._glass_hi,
+            darkcolor="#C3CBD9",
+            relief="solid",
+            borderwidth=1,
         )
-        style.configure("TLabelframe.Label", background=self._bg, foreground=self._muted, font=("Tahoma", 7, "bold"))
+        style.configure(
+            "TLabelframe.Label",
+            background=self._bg,
+            foreground=self._muted,
+            font=("Segoe UI", 8, "bold"),
+        )
+        style.configure(
+            "Vertical.TScrollbar",
+            background="#E7EBF3",
+            troughcolor=self._bg,
+            bordercolor=self._bg,
+            arrowcolor=self._muted,
+        )
+        # notebook — the two-tab shell
+        style.configure("TNotebook", background=self._bg, bordercolor=self._line, tabmargins=(2, 4, 2, 0))
+        style.configure(
+            "TNotebook.Tab",
+            background="#E3E8F1",
+            foreground=self._muted,
+            padding=(16, 6),
+            font=("Segoe UI", 9, "bold"),
+            bordercolor=self._line,
+            lightcolor="#FFFFFF",
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", self._face), ("active", "#EDF1F8")],
+            foreground=[("selected", self._slate)],
+            expand=[("selected", (0, 0, 0, 0))],
+        )
+
+        # real translucency — the "glass" part of Liquid Glass
+        try:
+            self.attributes("-alpha", 0.98)
+        except tk.TclError:
+            pass
+        # light DWM title bar to match the light body
+        self.after(60, self._apply_titlebar_theme)
+
+    def _apply_titlebar_theme(self) -> None:
+        """Match the native Windows frame to the light glass body."""
+        try:
+            import ctypes
+
+            self.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            if not hwnd:
+                hwnd = self.winfo_id()
+            value = ctypes.c_int(0)          # 0 = light, 1 = dark
+            for attr in (20, 19):            # DWMWA_USE_IMMERSIVE_DARK_MODE
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)
+                )
+        except Exception:
+            log.debug("title bar theme unavailable", exc_info=True)
 
     def _build_ui(self) -> None:
-        self.geometry("470x580")
-        self.minsize(450, 520)
+        self.geometry("540x620")
+        self.minsize(520, 560)
         self.configure(bg=self._bg)
 
-        root = ttk.Frame(self, style="Panel.TFrame", padding=(6, 4))
+        root = ttk.Frame(self, style="Panel.TFrame", padding=(8, 6))
         root.grid(row=0, column=0, sticky="nsew")
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(3, weight=1)
+        root.rowconfigure(1, weight=1)
 
         self.name_var = tk.StringVar()
         self.host_var = tk.StringVar()
@@ -2962,10 +3101,13 @@ class App(tk.Tk):
         head.grid(row=0, column=0, sticky="ew")
         self._logo_photo = None
         for candidate in (
-            APP_DIR / "assets" / "selfproxy-logo.png",
+            APP_DIR / "assets" / "localproxy-mark.png",
+            APP_DIR / "assets" / "localproxy-logo-128.png",
+            APP_DIR / "assets" / "localproxy-logo.png",
             APP_DIR / "assets" / "selfproxy-logo-128.png",
-            APP_DIR / "assets" / "proxy-logo.png",
+            APP_DIR / "assets" / "selfproxy-logo.png",
             APP_DIR / "assets" / "proxy-logo-128.png",
+            APP_DIR / "assets" / "proxy-logo.png",
         ):
             if not candidate.exists():
                 continue
@@ -2987,7 +3129,7 @@ class App(tk.Tk):
                 row=0, column=0, sticky="w", padx=(0, 4)
             )
             brand_col = 1
-        ttk.Label(head, text="SelfProxy", style="Brand.TLabel").grid(row=0, column=brand_col, sticky="w")
+        ttk.Label(head, text="Local Proxy", style="Brand.TLabel").grid(row=0, column=brand_col, sticky="w")
         status_col = brand_col + 1
         head.columnconfigure(status_col, weight=1)
         self.status_label = ttk.Label(head, textvariable=self.status_var, style="StatusOff.TLabel", cursor="hand2")
@@ -2995,9 +3137,22 @@ class App(tk.Tk):
         self.status_label.bind("<Double-Button-1>", lambda _e: self.run_diagnose())
         self._tip(self.status_label, "Состояние прокси.\nДвойной клик — диагностика parent.")
 
-        # proxy fields — compact, с подписями полей
-        box = ttk.LabelFrame(root, text=" Proxy ", padding=(6, 5))
-        box.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        # ── two tabs: connection vs apps/browser ──────────────────
+        nb = ttk.Notebook(root)
+        nb.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        tab_conn = ttk.Frame(nb, style="Panel.TFrame", padding=(10, 10))
+        tab_apps = ttk.Frame(nb, style="Panel.TFrame", padding=(10, 10))
+        nb.add(tab_conn, text="   Подключение   ")
+        nb.add(tab_apps, text="   Приложения   ")
+        tab_conn.columnconfigure(0, weight=1)
+        tab_apps.columnconfigure(0, weight=1)
+        tab_apps.rowconfigure(3, weight=1)
+        self._tab_conn = tab_conn
+        self._tab_apps = tab_apps
+
+        # ── tab 1: parent connection ──────────────────────────────
+        box = ttk.LabelFrame(tab_conn, text=" Parent-прокси ", padding=(8, 7))
+        box.grid(row=0, column=0, sticky="ew")
         box.columnconfigure(0, weight=1)
 
         lbl_w = 7
@@ -3056,10 +3211,16 @@ class App(tk.Tk):
         self.port_entry.grid(row=0, column=1, sticky="w")
         self._tip(self.port_entry, "Порт parent-прокси (1–65535)")
         self.proto_combo = ttk.Combobox(
-            pprow, textvariable=self.proto_var, values=(PROTO_HTTP, PROTO_SOCKS5), state="readonly", width=8
+            pprow, textvariable=self.proto_var, values=PROTO_CHOICES, state="readonly", width=8
         )
         self.proto_combo.grid(row=0, column=2, sticky="w", padx=(10, 0))
-        self._tip(self.proto_combo, "Протокол parent: HTTP CONNECT или SOCKS5")
+        self._tip(
+            self.proto_combo,
+            "Протокол parent:\n"
+            "HTTP — обычный CONNECT\n"
+            "HTTPS — TLS до прокси, затем CONNECT\n"
+            "SOCKS5 — с логином и паролем",
+        )
 
         arow = ttk.Frame(box, style="Panel.TFrame")
         arow.grid(row=4, column=0, sticky="ew", pady=(0, 3))
@@ -3102,16 +3263,30 @@ class App(tk.Tk):
         ep.bind("<Button-1>", lambda _e: self.copy_endpoints())
         self._tip(ep, "Локальные адреса прокси.\nКлик — скопировать.")
 
-        # apps — compact
-        self.apps_wrap = ttk.LabelFrame(root, text=" Apps ", padding=(3, 2))
-        self.apps_wrap.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        hint = ttk.Label(
+            tab_conn,
+            style="Muted.TLabel",
+            justify="left",
+            wraplength=470,
+            text=(
+                "Connect поднимает локальный прокси на 127.0.0.1 и параллельно проверяет "
+                "parent по HTTP, HTTPS и SOCKS5 — поднимется на том, который ответил.\n"
+                "Список приложений и запуск браузера в изолированном профиле — "
+                "на вкладке «Приложения»."
+            ),
+        )
+        hint.grid(row=1, column=0, sticky="nw", pady=(12, 0))
+
+        # ── tab 2: apps + browser + log ───────────────────────────
+        self.apps_wrap = ttk.LabelFrame(tab_apps, text=" Apps ", padding=(5, 4))
+        self.apps_wrap.grid(row=0, column=0, sticky="nsew")
         self.apps_wrap.columnconfigure(0, weight=1)
         apps_row = ttk.Frame(self.apps_wrap, style="Panel.TFrame")
         apps_row.grid(row=0, column=0, sticky="ew")
         apps_row.columnconfigure(0, weight=1)
         self.apps_list = tk.Listbox(
             apps_row,
-            height=2,
+            height=6,
             activestyle="dotbox",
             borderwidth=1,
             relief="sunken",
@@ -3139,21 +3314,28 @@ class App(tk.Tk):
         del_app_btn.grid(row=2, column=0)
         self._tip(del_app_btn, "Убрать из списка")
 
-        # connect + browser + log
-        bottom = ttk.Frame(root, style="Panel.TFrame")
-        bottom.grid(row=3, column=0, sticky="nsew", pady=(4, 0))
-        bottom.columnconfigure(0, weight=1)
-        bottom.rowconfigure(3, weight=1)
-
-        row1 = ttk.Frame(bottom, style="Panel.TFrame")
-        row1.grid(row=0, column=0, sticky="ew")
+        # ── always-visible action bar (below the tabs) ────────────
+        row1 = ttk.Frame(root, style="Panel.TFrame")
+        row1.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         row1.columnconfigure(0, weight=1)
         self.connect_btn = ttk.Button(row1, text="⚡ Connect", style="Primary.TButton", command=self.toggle_proxy)
         self.connect_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3))
         self._tip(self.connect_btn, "Запустить локальный прокси (Enter).\nПовторное нажатие — остановить.")
+        self.disconnect_btn = ttk.Button(
+            row1,
+            text="⏻ Disconnect",
+            style="Danger.TButton",
+            command=self.disconnect_proxy,
+            state="disabled",
+        )
+        self.disconnect_btn.grid(row=0, column=1, sticky="ew")
+        self._tip(
+            self.disconnect_btn,
+            "Разорвать соединение: остановить listener,\nснять системный прокси и закрыть туннели.",
+        )
 
-        row2 = ttk.Frame(bottom, style="Panel.TFrame")
-        row2.grid(row=1, column=0, sticky="ew", pady=(3, 0))
+        row2 = ttk.Frame(tab_apps, style="Panel.TFrame")
+        row2.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         row2.columnconfigure(1, weight=1)
         saved_browser = str(self.config_data.get("browser", BROWSER_CHROME)).lower()
         if saved_browser not in BROWSER_CHOICES:
@@ -3183,8 +3365,8 @@ class App(tk.Tk):
         self._tip(open_browser_btn, "Открыть браузер с выбранным профилем")
 
         # browser profile (isolated user-data-dir) — separate from proxy connection profile
-        row_bp = ttk.Frame(bottom, style="Panel.TFrame")
-        row_bp.grid(row=2, column=0, sticky="ew", pady=(3, 0))
+        row_bp = ttk.Frame(tab_apps, style="Panel.TFrame")
+        row_bp.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         row_bp.columnconfigure(1, weight=1)
         ttk.Label(row_bp, text="профиль", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 3))
         self.browser_profile_combo = ttk.Combobox(
@@ -3206,8 +3388,8 @@ class App(tk.Tk):
         bp_tmp_btn.grid(row=0, column=4, sticky="e")
         self._tip(bp_tmp_btn, "Разовый профиль — удалится после закрытия браузера")
 
-        log_frame = ttk.LabelFrame(bottom, text=" Log ", padding=(4, 2))
-        log_frame.grid(row=3, column=0, sticky="nsew", pady=(6, 0))
+        log_frame = ttk.LabelFrame(tab_apps, text=" Log ", padding=(6, 4))
+        log_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(1, weight=1)
 
@@ -3221,7 +3403,7 @@ class App(tk.Tk):
 
         self.log_text = scrolledtext.ScrolledText(
             log_frame,
-            height=5,
+            height=10,
             wrap="word",
             state="disabled",
             bg=self._log_bg,
@@ -3257,6 +3439,11 @@ class App(tk.Tk):
                 self.connect_btn.configure(text="━╳━ Disconnect", style="Danger.TButton")
             else:
                 self.connect_btn.configure(text="⚡ Connect", style="Primary.TButton")
+        if hasattr(self, "disconnect_btn"):
+            try:
+                self.disconnect_btn.configure(state="normal" if online else "disabled")
+            except tk.TclError:
+                pass
 
 
     def _tip(self, widget: tk.Misc, text: str) -> None:
@@ -3274,22 +3461,23 @@ class App(tk.Tk):
             self.pass_toggle.configure(text="🙈" if self._password_shown else "👁")
 
     def _apply_window_icon(self) -> None:
-        ico = APP_DIR / "assets" / "selfproxy.ico"
-        if not ico.exists():
-            ico = APP_DIR / "assets" / "proxy.ico"
-        png = APP_DIR / "assets" / "selfproxy-logo-128.png"
-        if not png.exists():
-            png = APP_DIR / "assets" / "proxy-logo-128.png"
-        if not png.exists():
-            png = APP_DIR / "assets" / "selfproxy-logo.png"
-        if not png.exists():
-            png = APP_DIR / "assets" / "proxy-logo.png"
+        def first(*names: str) -> Optional[Path]:
+            for name in names:
+                p = APP_DIR / "assets" / name
+                if p.exists():
+                    return p
+            return None
+
+        ico = first("localproxy.ico", "selfproxy.ico", "proxy.ico")
+        png = first("localproxy-logo-128.png", "localproxy-logo.png",
+                    "selfproxy-logo-128.png", "selfproxy-logo.png",
+                    "proxy-logo-128.png", "proxy-logo.png")
         try:
-            if ico.exists():
+            if ico is not None:
                 self.iconbitmap(default=str(ico))
         except tk.TclError:
             pass
-        if png.exists():
+        if png is not None:
             try:
                 photo = tk.PhotoImage(file=str(png))
                 self._icon_photos.append(photo)
@@ -3639,6 +3827,16 @@ class App(tk.Tk):
         else:
             self.enable_proxy()
 
+    def disconnect_proxy(self) -> None:
+        """Explicit disconnect — no toggle guessing: stop the listener, drop the
+        system proxy and let live tunnels die with their sockets."""
+        if getattr(self, "_connecting", False):
+            return
+        if not self.forwarder:
+            self._set_status("offline", online=False)
+            return
+        self.disable_proxy()
+
     def apply_paste(self) -> None:
         text = self.paste_var.get().strip()
         if not text:
@@ -3859,6 +4057,8 @@ class App(tk.Tk):
         self._connecting = True
         if hasattr(self, "connect_btn"):
             self.connect_btn.configure(state="disabled")
+        if hasattr(self, "disconnect_btn"):
+            self.disconnect_btn.configure(state="disabled")
         self._ui_log(f"check {prefer} {format_endpoint(host, port)}…")
         self._set_status("connecting…", online=False)
 

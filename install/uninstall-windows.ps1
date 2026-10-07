@@ -1,4 +1,4 @@
-﻿# SelfProxy — Windows uninstaller
+﻿# Local Proxy — Windows uninstaller
 #
 # Usage:
 #   .\uninstall-windows.ps1            # remove shortcuts + registry, keep config/logs
@@ -12,11 +12,16 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$AppName = 'SelfProxy'
+$AppName = 'Local Proxy'
 
 $scriptDir = $PSScriptRoot
-$AppRoot = Split-Path -Parent $scriptDir                     # <app>/install/.. = <app>
-$marker = Join-Path $AppRoot '.selfproxy_install.json'
+$AppRoot = Split-Path -Parent $scriptDir                     # <app>/install/.. = <app>\
+# also accept the pre-rename marker so an older SelfProxy install can still be removed
+$marker = Join-Path $AppRoot '.localproxy_install.json'
+if (-not (Test-Path $marker)) {
+    $legacy = Join-Path $AppRoot '.selfproxy_install.json'
+    if (Test-Path $legacy) { $marker = $legacy }
+}
 if (Test-Path $marker) {
     try { $AppRoot = (Get-Content $marker -Raw | ConvertFrom-Json).appRoot } catch { }
 }
@@ -36,7 +41,10 @@ if ($DryRun) { Warn "DRY RUN — ничего не удаляется" }
 Step "Ярлыки"
 foreach ($lnk in @(
     (Join-Path ([Environment]::GetFolderPath('Desktop')) "$AppName.lnk"),
+    (Join-Path ([Environment]::GetFolderPath('Desktop')) "SelfProxy.lnk"),
     (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\$AppName.lnk"),
+    (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\SelfProxy.lnk"),
+    (Join-Path $AppRoot 'Start Local Proxy.lnk'),
     (Join-Path $AppRoot 'Start SelfProxy.lnk')
 )) {
     if (Test-Path $lnk) { Run "rm $lnk" { Remove-Item -LiteralPath $lnk -Force }; Ok "удалён: $lnk" }

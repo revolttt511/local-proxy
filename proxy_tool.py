@@ -29,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -36,7 +37,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 from typing import Any, Callable, Optional
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import unquote, urlparse, urlunparse
 
 try:
     import ctypes
@@ -60,8 +61,9 @@ UPSTREAM_TIMEOUT = 12.0
 PROTO_HTTP = "HTTP"
 PROTO_HTTPS = "HTTPS"
 PROTO_SOCKS5 = "SOCKS5"
+PROTO_VLESS = "VLESS"
 # Parent protocols we can talk to. HTTPS = TLS to the parent, then CONNECT inside.
-PROTO_CHOICES = (PROTO_HTTP, PROTO_HTTPS, PROTO_SOCKS5)
+PROTO_CHOICES = (PROTO_HTTP, PROTO_HTTPS, PROTO_SOCKS5, PROTO_VLESS)
 SCOPE_APPS = "apps"
 SCOPE_SYSTEM = "system"
 BROWSER_CHROME = "chrome"
@@ -190,6 +192,48 @@ def tls_wrap_parent(sock: socket.socket, host: str, timeout: float = CONNECT_TIM
     return ctx.wrap_socket(sock, server_hostname=server_hostname)
 
 
+def parse_vless_uri(raw: str) -> Optional[dict[str, str]]:
+    """Parse a vless:// share link into the shape the rest of the app uses.
+
+    vless://<uuid>@<host>:<port>?<query>#<name>
+
+    The UUID lands in ``username`` and the query string in ``password`` (VLESS
+    has no password), so config, UI and the probe need no extra plumbing.
+    """
+    body = raw.split("://", 1)[1] if "://" in raw else raw
+    fragment = ""
+    if "#" in body:
+        body, fragment = body.split("#", 1)
+    query = ""
+    if "?" in body:
+        body, query = body.split("?", 1)
+    if "@" not in body:
+        return None
+    uuid_str, hostport = body.rsplit("@", 1)
+    host, port_s = split_host_port(hostport)
+    if not host or not port_s or not port_s.isdigit():
+        return None
+    return {
+        "host": strip_brackets(host),
+        "port": port_s,
+        "username": uuid_str.strip(),
+        "password": query,
+        "protocol": PROTO_VLESS,
+        "name": unquote(fragment).strip(),
+    }
+
+
+def parse_query(query: str) -> dict[str, str]:
+    """``security=none&type=tcp&sni=x`` → {'security': 'none', ...} (lower keys)."""
+    out: dict[str, str] = {}
+    for part in (query or "").split("&"):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            if key.strip():
+                out[key.strip().lower()] = value.strip()
+    return out
+
+
 def parse_proxy_string(text: str) -> Optional[dict[str, str]]:
     """Parse common seller formats into host/port/user/pass/protocol.
 
@@ -201,6 +245,8 @@ def parse_proxy_string(text: str) -> Optional[dict[str, str]]:
 
     protocol = PROTO_HTTP
     lower = raw.lower()
+    if lower.startswith("vless://"):
+        return parse_vless_uri(raw)
     if lower.startswith("socks5://"):
         protocol = PROTO_SOCKS5
         raw = raw[9:]
@@ -491,6 +537,25 @@ def probe_upstream(
 ) -> str:
     host = strip_brackets(host)
     ep = format_endpoint(host, port)
+    if protocol == PROTO_VLESS:
+        # No reply handshake in VLESS, so prove the tunnel by pulling a byte
+        # back through it — a bare TCP connect would "pass" on any open port.
+        try:
+            s = vless_connect(host, port, username, parse_query(password), "example.com", 80)
+            try:
+                s.settimeout(timeout)
+                s.sendall(b"GET / HTTP/1.0\r\nHost: example.com\r\n\r\n")
+                if not s.recv(64):
+                    raise OSError("пустой ответ — туннель не работает")
+            finally:
+                s.close()
+            return f"VLESS OK → {ep}"
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"VLESS {ep}: timeout. Проверьте UUID, security и адрес сервера.\n{IPV6_HINT}"
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(f"VLESS {ep}: {exc}") from exc
     if protocol == PROTO_SOCKS5:
         try:
             s = socks5_connect(host, port, "example.com", 443, username, password, timeout=timeout)
@@ -648,6 +713,74 @@ def _pipe_sockets(a: socket.socket, b: socket.socket, stop: threading.Event) -> 
     except OSError:
         return
 
+def _vless_addr(host: str) -> tuple[bytes, int]:
+    """VLESS address: 1 = IPv4, 2 = domain, 3 = IPv6 (NOT the SOCKS5 numbering)."""
+    try:
+        return socket.inet_pton(socket.AF_INET, host), 0x01
+    except OSError:
+        pass
+    try:
+        return socket.inet_pton(socket.AF_INET6, host), 0x03
+    except OSError:
+        pass
+    try:
+        name = host.encode("idna")
+    except UnicodeError:
+        name = host.encode("utf-8", "replace")
+    return bytes([len(name)]) + name, 0x02
+
+
+def vless_connect(
+    parent_host: str,
+    parent_port: int,
+    uuid_str: str,
+    opts: dict[str, str],
+    target_host: str,
+    target_port: int,
+) -> socket.socket:
+    """Open a VLESS (Xray) session to ``target`` through the parent.
+
+    Request: version | UUID(16) | addon-len | command | port(2) | atyp | addr.
+    VLESS has no reply handshake — once the header is out the socket IS the
+    tunnel, so nothing can be validated here beyond the TCP/TLS setup.
+    """
+    try:
+        uuid_bytes = uuid.UUID(uuid_str.strip()).bytes
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise OSError(f"VLESS: неверный UUID «{uuid_str}»") from exc
+
+    security = (opts.get("security") or "none").lower()
+    if security in ("reality", "xtls"):
+        raise OSError(
+            f"VLESS: security={security} не поддерживается — нужен xray/reality-клиент"
+        )
+
+    sock = socket.create_connection((parent_host, parent_port), timeout=CONNECT_TIMEOUT)
+    try:
+        sock.settimeout(UPSTREAM_TIMEOUT)
+        if security == "tls":
+            sni = opts.get("sni") or opts.get("host") or parent_host
+            sock = tls_wrap_parent(sock, sni)
+            sock.settimeout(UPSTREAM_TIMEOUT)
+        addr, atyp = _vless_addr(target_host)
+        sock.sendall(
+            b"\x00"                      # version
+            + uuid_bytes
+            + b"\x00"                    # addon length: none
+            + b"\x01"                    # command: TCP
+            + struct.pack(">H", target_port)
+            + bytes([atyp])
+            + addr
+        )
+        return sock
+    except Exception:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+
+
 def open_via_parent(
     parent_host: str,
     parent_port: int,
@@ -663,6 +796,11 @@ def open_via_parent(
     if protocol == PROTO_SOCKS5:
         return socks5_connect(
             parent_host, parent_port, target_host, target_port, username, password
+        )
+    if protocol == PROTO_VLESS:
+        return vless_connect(
+            parent_host, parent_port, username, parse_query(password),
+            target_host, target_port,
         )
 
     sock = socket.create_connection((parent_host, parent_port), timeout=CONNECT_TIMEOUT)
@@ -3304,7 +3442,8 @@ class App(tk.Tk):
             "Протокол parent:\n"
             "HTTP — обычный CONNECT\n"
             "HTTPS — TLS до прокси, затем CONNECT\n"
-            "SOCKS5 — с логином и паролем",
+            "SOCKS5 — SOCKS5 с логином и паролем\n"
+            "VLESS — Xray VLESS (security=none или tls)",
         )
 
         arow = ttk.Frame(box, style="Panel.TFrame")
@@ -3993,7 +4132,9 @@ class App(tk.Tk):
         self.user_var.set(parsed["username"])
         self.pass_var.set(parsed["password"])
         self.proto_var.set(parsed["protocol"])
-        self.name_var.set(format_endpoint(parsed["host"], int(parsed["port"])))
+        self.name_var.set(
+            parsed.get("name") or format_endpoint(parsed["host"], int(parsed["port"]))
+        )
         self._ui_log(f"ok {parsed['protocol']} {format_endpoint(parsed['host'], int(parsed['port']))}")
 
     def _connections(self) -> list[dict[str, Any]]:
